@@ -1,3 +1,6 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # Code for DTU course 02460 (Advanced Machine Learning Spring) by Jes Frellsen, 2024
 # Version 1.2 (2024-02-06)
 # Inspiration is taken from:
@@ -17,7 +20,9 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
 from torch_geometric.utils import to_dense_adj
 import matplotlib.pyplot as plt
-from metrics import evaluate_novelty_and_uniqueness
+from metrics import evaluate_novelty_and_uniqueness, plot_training_loss, plot_graph_statistics
+from graph_baseline import ErdosRenyiBaseline
+import networkx as nx
 
 class GaussianPrior(nn.Module):
     def __init__(self, M):
@@ -239,40 +244,47 @@ class GaussianGraphEncoder(nn.Module):
         return td.Independent(td.Normal(loc=mean, scale=torch.exp(log_std)), 1)
 
 
-def train(model, optimizer, data_loader, epochs, device, beta=1.0):
+def train(model, optimizer, data_loader, epochs, device, beta=1.0, scheduler=None):
     """
-    Train a VAE model.
-
-    Parameters:
-    model: [VAE]
-       The VAE model to train.
-    optimizer: [torch.optim.Optimizer]
-         The optimizer to use for training.
-    data_loader: [torch.utils.data.DataLoader]
-            The data loader to use for training.
-    epochs: [int]
-        Number of epochs to train for.
-    device: [torch.device]
-        The device to use for training.
+    Train a VAE model with interactive plotting and optional LR scheduling.
     """
+    from metrics import plot_training_loss  # Import the new plotting function
+    
     model.train()
 
-    total_steps = len(data_loader)*epochs
+    total_steps = len(data_loader) * epochs
     progress_bar = tqdm(range(total_steps), desc="Training")
+
+    epoch_losses = []  # List to track the average loss per epoch
 
     for epoch in range(epochs):
         data_iter = iter(data_loader)
+        
+        running_epoch_loss = 0.0
+        num_batches = 0
+        
         for x in data_iter:
             x = x[0].to(device)
             optimizer.zero_grad()
             loss = model(x, beta)
             loss.backward()
             optimizer.step()
+            
+            running_epoch_loss += loss.item()
+            num_batches += 1
 
             # Update progress bar
             progress_bar.set_postfix(loss=f"⠀{loss.item():12.4f}", epoch=f"{epoch+1}/{epochs}")
             progress_bar.update()
-
+            
+        # At the end of each epoch, compute the average loss and update the plot
+        avg_epoch_loss = running_epoch_loss / num_batches
+        epoch_losses.append(avg_epoch_loss)
+        plot_training_loss(epoch_losses)
+        
+        # Step the scheduler if it was provided
+        if scheduler is not None:
+            scheduler.step()
 
 def evalELBO(model, test_loader, device):
     total_elbo = 0.0
@@ -349,16 +361,18 @@ if __name__ == "__main__":
     # Parse arguments
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample', 'eval', 'train-multiple'], help='what to do when running the script (default: %(default)s)')
-    parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
+    parser.add_argument('mode', type=str, nargs='?', default='sample', choices=['train', 'sample', 'eval', 'train-multiple', 'plot-stats'], help='what to do when running the script (default: %(default)s)')
+    parser.add_argument('--model', type=str, default='2.pt', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=10, metavar='N', help='number of epochs to train (default: %(default)s)')
-    parser.add_argument('--latent-dim', type=int, default=10, metavar='M', help='dimension of latent variable (default: %(default)s)')
+    parser.add_argument('--latent-dim', type=int, default=32, metavar='M', help='dimension of latent variable (default: %(default)s)')
     parser.add_argument('--num-components', type=int, default=3, metavar='K', help='number of MoG prior components (default: %(default)s)')
     parser.add_argument('--beta', type=float, default=1.0, help='beta value for beta-VAE (default: %(default)s)')
     parser.add_argument('--max-nodes', type=int, default=28, help='maximum number of nodes in the graph (default: %(default)s)')
+    parser.add_argument('--use-scheduler', action='store_true', help='enable ExponentialLR scheduler (default: False)')
+    parser.add_argument('--plot-stats', action='store_true', help='plot structural statistics 3x3 histogram grid')
 
     args = parser.parse_args()
     print('# Options')
@@ -397,13 +411,55 @@ if __name__ == "__main__":
 
     model = GraphVAE(prior, decoder, encoder).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    # Initialize the scheduler if the flag is passed
+    if args.use_scheduler:
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
+        print("Using ExponentialLR scheduler with gamma=0.995")
+    else:
+        scheduler = None
 
     if args.mode == 'train':
-        train(model, optimizer, train_loader, args.epochs, device, args.beta)
+        train(model, optimizer, train_loader, args.epochs, device, args.beta, scheduler=scheduler)
         torch.save(model.state_dict(), args.model)
     
     elif args.mode == 'sample':
         model.load_state_dict(torch.load(args.model, map_location=device))
+        
+        print("\n--- Evaluating VAE Model ---")
         evaluate_novelty_and_uniqueness(model, train_dataset, num_samples=1000, device=device)
+        
+        print("\n--- Evaluating Erdös-Rényi Baseline ---")
+        from metrics import evaluate_baseline_novelty_and_uniqueness
+        
+        baseline = ErdosRenyiBaseline(train_dataset)
+        evaluate_baseline_novelty_and_uniqueness(baseline, train_dataset, num_samples=1000)
+
+    elif args.mode == 'plot-stats':
+        print("\n--- Generating Graphs for Statistics ---")
+        model.load_state_dict(torch.load(args.model, map_location=device))
+        model.eval()
+        
+        num_samples = 1000
+        
+        # 1. Baseline generation
+        baseline = ErdosRenyiBaseline(train_dataset)
+        baseline_graphs = baseline.sample(num_samples=num_samples)
+        
+        # 2. VAE generation
+        with torch.no_grad():
+            z = prior().sample(torch.Size([num_samples])).to(device)
+            adj_continuous = decoder(z).mean.cpu().numpy()
+            
+        vae_graphs = []
+        for i in range(num_samples):
+            # Threshold to binary representation as in your WL metric
+            adj_binary = (adj_continuous[i] > 0.5).astype(np.int8)
+            G = nx.from_numpy_array(adj_binary)
+            vae_graphs.append(G)
+            
+        # 3. Real graphs come from train_dataset
+        # Plot the grid
+        plot_graph_statistics(train_dataset, baseline_graphs, vae_graphs)
 
 
